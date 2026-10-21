@@ -1,0 +1,237 @@
+# OpenClaw + OpenVPN Access Server + Nginx Proxy Manager
+# Stack for Unraid / Ubuntu Docker host
+#
+# Start:   docker compose up -d
+# Status:  docker compose ps
+# Logs:    docker compose logs -f openclaw-gateway
+#
+# Copy .env.example -> .env and fill in tokens BEFORE first start.
+
+name: openclaw-stack
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ── Reverse proxy / TLS termination ────────────────────────────────
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: npm
+    restart: unless-stopped
+    ports:
+      - "80:80"        # HTTP / ACME challenge
+      - "443:443"      # HTTPS
+      - "81:81"        # NPM admin UI
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-UTC}
+      # First boot creates admin@example.com / changeme — change it immediately.
+      DISABLE_IPV6: "true"
+    volumes:
+      - npm-data:/data
+      - npm-letsencrypt:/etc/letsencrypt
+    networks:
+      frontend:
+        # Fixed IP so OpenClaw's gateway.trustedProxies can allow exactly this
+        # hop instead of trusting the whole bridge subnet.
+        ipv4_address: ${NPM_IP:-172.28.0.10}
+    healthcheck:
+      test: ["CMD", "/usr/bin/check-health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
+
+  # ── OpenVPN Access Server (remote access) ──────────────────────────
+  # Access the admin UI at https://<host>:943/admin  (default: openvpn/your-configured-password)
+  # and the client portal at https://<host>:943
+  #
+  # Router forwarding needed for this to be reachable remotely:
+  #   943/tcp, 9443/tcp, 1194/udp  ->  <this host>
+  #
+  # If you instead want a VPN CLIENT (route OpenClaw's outbound traffic
+  # through a commercial VPN), comment out this whole block and use the
+  # alternative at the bottom of this file.
+  openvpn-as:
+    image: linuxserver/openvpn-as:latest
+    container_name: openvpn-as
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "943:943"        # Admin + client web UI
+      - "9443:9443"      # HTTPS tunnel (TCP)
+      - "1194:1194/udp"  # OpenVPN tunnel (UDP)
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-UTC}
+      INTERFACE: eth0
+      PASSWORD: ${OPENVPN_ADMIN_PASSWORD:?Set OPENVPN_ADMIN_PASSWORD in .env}
+    volumes:
+      - openvpn-config:/config
+    networks:
+      - frontend
+    logging: *default-logging
+
+  # ── One-shot: create the NPM proxy host for the OpenClaw Control UI ─
+  # Not part of the default `up`. Run explicitly once NPM is healthy:
+  #   docker compose --profile init run --rm npm-init
+  # Idempotent — re-running skips an already-configured host.
+  npm-init:
+    image: alpine:3.20
+    container_name: npm-init
+    restart: "no"
+    depends_on:
+      nginx-proxy-manager:
+        condition: service_healthy
+    environment:
+      NPM_API_URL: http://npm:81
+      NPM_ADMIN_EMAIL: ${NPM_ADMIN_EMAIL:-admin@example.com}
+      NPM_ADMIN_PASSWORD: ${NPM_ADMIN_PASSWORD:-changeme}
+      OPENCLAW_DOMAIN: ${OPENCLAW_DOMAIN:?set OPENCLAW_DOMAIN in .env}
+      OPENCLAW_UPSTREAM_HOST: openclaw-gateway
+      OPENCLAW_UPSTREAM_PORT: "18789"
+      OPENCLAW_TLS_ENABLED: ${OPENCLAW_TLS_ENABLED:-true}
+      NPM_UPDATE_EXISTING: ${NPM_UPDATE_EXISTING:-false}
+    volumes:
+      - ./npm-init.sh:/usr/local/bin/npm-init.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/npm-init.sh"]
+    networks:
+      - frontend
+    profiles: ["init"]
+    logging: *default-logging
+
+  # ── OpenClaw Gateway ───────────────────────────────────────────────
+  openclaw-gateway:
+    image: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+    container_name: openclaw-gateway
+    restart: unless-stopped
+    # uid 1000 (node) inside the image.
+    environment:
+      TZ: ${TZ:-UTC}
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:?Set OPENCLAW_GATEWAY_TOKEN in .env}
+      # Provider keys — uncomment/set the ones you use.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Channel tokens (Telegram uses --use-env so the token stays out of openclaw.json)
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      # Set to 1 to enable the agent sandbox (also needs docker.sock mounted — see notes).
+      OPENCLAW_SANDBOX: ${OPENCLAW_SANDBOX:-0}
+    volumes:
+      # Named volume = real local filesystem. REQUIRED for SQLite state.
+      # Do NOT bind-mount /mnt/user/... on Unraid (shfs/FUSE) — startup exits 78.
+      - openclaw-state:/home/node/.openclaw
+      # If you want the workspace on a host path instead, use a POOL path only:
+      # - /mnt/cache/appdata/openclaw/workspace:/home/node/.openclaw/workspace
+    networks:
+      - frontend
+      - internal
+    # Reachable from NPM as http://openclaw-gateway:18789 on the frontend network.
+    # Not published to the host — the Control UI goes through NPM.
+    # Uncomment for direct LAN access during setup:
+    # ports:
+    #   - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18789/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging: *default-logging
+
+  # ── OpenClaw CLI sidecar (shares the Gateway network namespace) ────
+  # Used for one-off admin commands:
+  #   docker compose run --rm openclaw-cli dashboard --no-open
+  #   docker compose run --rm openclaw-cli config get gateway.bind
+  #   docker compose run --rm openclaw-cli channels add --channel telegram --use-env
+  openclaw-cli:
+    image: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+    container_name: openclaw-cli
+    network_mode: "service:openclaw-gateway"
+    # Shares PID namespace so ownership checks see the Gateway's processes.
+    pid: "service:openclaw-gateway"
+    environment:
+      TZ: ${TZ:-UTC}
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN:?Set OPENCLAW_GATEWAY_TOKEN in .env}
+    volumes:
+      - openclaw-state:/home/node/.openclaw
+    depends_on:
+      - openclaw-gateway
+    entrypoint: ["sleep", "infinity"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+    profiles: ["tools"]
+    logging: *default-logging
+
+# ── Alternative: OpenVPN as a CLIENT ───────────────────────────────────
+# Routes traffic of containers on the `vpn` network out through a VPN provider.
+# Replace the openvpn-as service above with this, then attach the containers
+# you want tunneled to the `vpn` network.
+#
+#  openvpn-client:
+#    image: dperson/openvpn-client:latest
+#    container_name: openvpn-client
+#    restart: unless-stopped
+#    cap_add:
+#      - NET_ADMIN
+#    devices:
+#      - /dev/net/tun:/dev/net/tun
+#    stdin_open: true
+#    tty: true
+#    sysctls:
+#      - net.ipv6.conf.all.disable_ipv6=0
+#    volumes:
+#      - ./openvpn:/vpn:ro        # drop your .ovpn + creds here
+#    networks:
+#      - vpn
+#    command: >
+#      -f "" --auth-user-pass /vpn/auth.conf -r "10.0.0.0/8 172.16.0.0/12
+#      192.168.0.0/16" --dcdup
+# ───────────────────────────────────────────────────────────────────────
+
+networks:
+  # NPM <-> OpenClaw <-> VPN admin. Bridge.
+  frontend:
+    name: npm-frontend
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        # Explicit subnet: NPM gets the fixed .10 above, and this is the CIDR
+        # OpenClaw trusts for forwarded-client-IP attribution.
+        - subnet: ${NPM_SUBNET:-172.28.0.0/16}
+          gateway: ${NPM_GATEWAY_IP:-172.28.0.1}
+  # Isolated network for containers that should NOT be proxied or exposed.
+  internal:
+    name: openclaw-internal
+    driver: bridge
+    internal: true
+  # Only needed for the VPN-client variant above.
+  # vpn:
+  #   name: vpn-net
+  #   driver: bridge
+
+volumes:
+  npm-data:
+    name: npm-data
+  npm-letsencrypt:
+    name: npm-letsencrypt
+  openvpn-config:
+    name: openvpn-as-config
+  openclaw-state:
+    name: openclaw-state
