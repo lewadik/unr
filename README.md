@@ -15,7 +15,7 @@ The stack includes the full proxy setup in `/home/leo/.openclaw/workspace/unraid
 
 **To deploy:**
 ```bash
-cd unraid-stack
+git clone https://github.com/lewadik/unr.git && cd unr/
 cp .env.example .env && chmod 600 .env  # fill in OPENCLAW_DOMAIN + tokens
 docker compose up -d nginx-proxy-manager openclaw-gateway
 docker compose --profile init run --rm npm-init
